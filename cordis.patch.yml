@@ -1,0 +1,6 @@
+# dsh-session-menu-delete bundle 层：插入「删除会话」插件行。
+# host 半提供删除 API，client 半往 sidebar.workspaces.session.menu.item 注册菜单项。
+- insert:
+    - id: dsh-session-menu-delete
+      name: 'dsh-session-menu-delete'
+      config: {}
