@@ -29,7 +29,9 @@ DSH 原生只有「归档」，没有删除；这个插件把它补上，并且*
 5. **它派生出的子代理会话**（级联，见下）
 6. **它独享的附件对象**（顺手清理，见下 —— 被别的会话共享的一律不动）
 
-会话仍在运行时，先按 DSH 自己的 retire 顺序摘除（`agent.cancel({kind:'disposed'})` → `scope.dispose()` → `agents.store.delete()` → sessions 条目 `detach()`），再删文件，避免留下"文件没了但注册表还在"的僵尸。
+会话仍在运行时，先按 DSH 自己的 dispose 顺序摘除：`agent.cancel({kind:'disposed'})` → **`await agent.whenIdle()`** → `agent.scope.dispose()`，**各自带超时、任一超时就中止整个删除**（绝不在 loop 还在收尾、句柄还没关的时候动文件），然后 `sessions.flush()` + 摘 sessions 条目（这一步会发出 DSH 原生的 `session/disposed`）。
+
+摘 agent 时会**补发配对的 `agent/disposed`**：`agents.enter()` 返回的正规 detach 闭包只交给 owner fiber，插件拿不到，而 `detachEntered` 开头的 `if (this.store.get(entry.id) !== entry) return;` 会让这条边**永久**发不出去（下游 goal-round-driver / schedule / subagent / file-reference / agent-team 会一直收不到）。补发的 payload 形状与 DSH 一致（`{ agent }`），只对已 announce 的条目发；已知不精确之处是构造不出 DSH 的 scope carrier，因此这次补发会到达所有 scope 的监听者。
 
 > ⚠️ **全部不可恢复**：会话工件没有回收站，附件也没有 —— 删掉就是删掉（早期版本给附件配过回收站，后来去掉了，理由见「附件孤儿清理」一节）。
 
@@ -82,6 +84,9 @@ fork 出来的会话是**自包含**的：分叉那一刻，历史以数据形�
 
 ## 附件孤儿清理：看一眼就等于引用一次
 
+> 📖 **机制详解见 [ATTACHMENT-CLEANUP.md](ATTACHMENT-CLEANUP.md)** —— 那一份讲清楚了判据的两个引用来源、判据的演进、以及草稿为什么不需要保护。
+> 本节是速览。
+
 附件不塞在会话日志里，而是**内容寻址**的独立对象：
 
 ```
@@ -97,23 +102,29 @@ fork 出来的会话是**自包含**的：分叉那一刻，历史以数据形�
 | `attachments/v1/objects/<前2位>/<sha256>` | **持久**附件，一份原始图，会话历史按哈希引用它 | 删了会话就裂图，只能按下面的规则清 |
 | `cache/attachments/request-images/<变体哈希>` | DSH 自己给**模型请求**生成的图片版本（按路由缩放/重新编码后缓存，跨轮复用）——不是本插件写的 | **随便删**，下次读取自动重建 |
 
+> ⚠️ 还有 `attachments/v1/file-objects/` 与 `attachments/v1/files/`（**文件类**附件），本插件**不清理** —— 漏删，不是误删。`/health` 的 `attachmentKinds` 如实回显。
+
 > `objects/<前2位>/` 这层分片目录**不会自己消失**：早期版本只搬走文件、留下空壳，在文件管理器里看着就是"一堆空文件夹"。现在删完对象会回头检查动过的分片、空了就删（有测试守着）。
 
 > ⚠️ **删除不可撤销 —— 本插件没有回收站。**（早期版本有一个，后来去掉了：见下方"为什么不要回收站"。）
 > 所以 `--clean` / `POST /attachments/clean` 是**真删**，删之前先用只读预览看清楚。
 
-清理有两个入口，共用同一套判据 —— **唯一区别是新鲜度窗口只作用于后者**：
+清理有**两个**入口，共用同一套判据：
 
-| 入口 | 触发方式 | 清理范围 | 新鲜度窗口 |
-|---|---|---|---|
-| **随会话删除顺手清**（默认开启） | 点菜单里的「删除会话」 | 只清**引用者全部落在本次被删集合内**的附件（含级联的子代理）；被 fork 副本或其它会话共享的一律不动 | **不适用**（见下） |
-| **独立清理** | `POST /attachments/clean` | 全库范围内所有孤儿 | 生效 |
+| 入口 | 触发方式 | 清理范围 |
+|---|---|---|
+| **随会话删除顺手清**（默认开启） | 点菜单里的「删除会话」 | 只清**引用者全部落在本次被删集合内**的附件（含级联的子代理）；被 fork 副本或其它会话共享的一律不动；**零引用**的也不归它管 |
+| **独立清理** | `POST /attachments/clean` | **全库**范围内所有孤儿 |
 
-两者都是**直接删除**。顺手清理可用请求体 `{"attachments": false}` 关掉。
+两者都是**直接删除、立即生效**：判定为独享（或独立清理判定为零引用）就当场删。顺手清理可用请求体 `{"attachments": false}` 关掉。
 
-> **为什么顺手清理不套新鲜度窗口？** 窗口防的是"引用还没落盘"，而能进这个集合的前提恰恰相反：引用**已经在盘上**、且引用者**全都要被删掉** —— 主人没了，它不可能再被谁需要。
-> 早期版本在这里也套了窗口，代价是：删掉一个刚读过图的会话，那些图被静默跳过，既不删、也不留任何痕迹，变成永远没人管的孤儿（实测踩过一次，一次 11 张、1.49 MB，因为它们只有 1–5 分钟大）。
-> 落盘实时性由 DSH 保证（实测每个会话日志的 mtime 就等于它最新事件的时间，没有可观测延迟）。
+> **引用集合有两个来源，缺一不可：**
+> 1. **活会话的内存事件**（`sessions.list()` → `session.ownEvents()`）—— 未落盘的引用在这里可见，几乎零成本（纯对象遍历，不解压、不解析 JSON）；
+> 2. **磁盘上的会话日志** —— 已经落盘的引用（含 fork 的 seed 历史）。
+>
+> 只看磁盘会有一个**结构性盲区**：一个「仍然存活、刚看过这张图、但引用还没落盘」的会话在磁盘上**根本不可见**，于是对象看起来"没人要了" —— 这正是 README 里记的那次 `Attachment object is missing.`。**补上内存来源之后盲区就关闭了**，这才是真正的修复。
+
+> ⚠️ **草稿里的图不需要保护**：图片是**发送时**才入库的（`admitPromptContent` → `saveImage`），贴进输入框时客户端只留字节、磁盘上**没有对象**。所以「删别的会话会不会弄裂我的草稿」—— **不会**。文件类附件倒是贴图时就上传，但它们的实体在 `file-objects/`、`files/`，**本插件不碰那两个目录**。
 
 > **为什么不要回收站？** 它救不了真正想救的东西：**删错会话时，会话日志本身不可恢复**，把附件还原出来也没有任何会话引用它们，等于一堆没主的图片躺在磁盘上。而它能救的唯一场景（误判"没人引用"→ 活会话裂图）代价换不来一个看不见、不会过期、只有 CLI 才能操作的目录。去掉之后判据反而更硬：**进不了"确定没人再用"这一步，就一个字节都不删。**
 
@@ -123,17 +134,20 @@ fork 出来的会话是**自包含**的：分叉那一刻，历史以数据形�
 
 1. **删除瞬间重算**引用，绝不复用上一次的扫描结果；
 2. **结构化解析** `attachmentId`（递归遍历事件 JSON，含 `tool/result` 里的图片），不做文本匹配 —— 文本搜 64 位 hex 会把日志里任何偶然的长十六进制串都当成引用（实测：探针自己打印的哈希写进日志后，11/11 全部假命中）；
-3. **新鲜度保护**：独立清理时，mtime 在窗口内（默认 15 分钟）的孤儿一律跳过 —— 刚上传、刚被看一眼的图，其引用可能还没落盘；**级联删除不适用这条**（主人已经没了）。
+3. **内存 + 磁盘两个来源都算**：活会话的 `ownEvents()` 覆盖「还没落盘」的引用，磁盘日志覆盖「已经落盘」的（含 fork 的 seed 历史）。只看磁盘就是那个会误删的盲区。
 
 没有回收站之后，这三条规则就是全部的防线，所以一条都不能省。
 
 ```powershell
+# 所有端点都要求自定义头 x-dsh-plugin-call: 1（见「HTTP 端点」一节的说明）
+$h = @{ "x-dsh-plugin-call" = "1" }
+
 # 1. 先看会删谁（只读，不动文件）
-Invoke-RestMethod "http://127.0.0.1:19387/session-menu-delete/api/attachments/orphans" | ConvertTo-Json -Depth 5
+Invoke-RestMethod "http://127.0.0.1:19387/session-menu-delete/api/attachments/orphans" -Headers $h | ConvertTo-Json -Depth 5
 
 # 2. 确认后删除（不带 confirm 同样只预览）
 Invoke-RestMethod -Method Post "http://127.0.0.1:19387/session-menu-delete/api/attachments/clean" `
-  -ContentType "application/json" -Body '{"confirm":true}' | ConvertTo-Json -Depth 5
+  -Headers $h -ContentType "application/json" -Body '{"confirm":true}' | ConvertTo-Json -Depth 5
 ```
 
 ## 安装
@@ -194,15 +208,40 @@ dsh plugin --profile desktop remove dsh-session-menu-delete
 
 ## HTTP 端点
 
+> 🔒 **所有端点都要求请求头 `x-dsh-plugin-call: 1`。** 自定义头必然触发 CORS 预检，而本服务端不返回任何 CORS 响应头 → 预检失败 → **网页根本发不出这个请求**。本机脚本/命令行补一个头即可（零成本）。
+> 另外，**带 `Origin` 的浏览器请求**还会走 DSH 自己的 Host/Origin 围栏 + 会话 cookie 校验（`connection.requestRejection`：跨站/异源 403、未认证 401）；本机脚本不带 `Origin`，不受影响。
+
 | 方法与路径 | 作用 |
 |---|---|
-| `POST /session-menu-delete/api/delete` | 删除会话（默认级联子代理）；body `{ sessionId, cascade? }` |
+| `POST /session-menu-delete/api/delete` | 删除会话（默认级联子代理）；body `{ sessionId, cascade?, attachments? }` |
 | `GET /session-menu-delete/api/lineage?sessionId=<id>` | 预演级联：列出该会话全部子代理后代 |
 | `GET /session-menu-delete/api/attachments/orphans` | 预览附件孤儿（只读，不动文件） |
-| `POST /session-menu-delete/api/attachments/clean` | 删除孤儿；body `{ confirm: true, freshMinutes? }` |
+| `POST /session-menu-delete/api/attachments/clean` | 删除孤儿；body `{ confirm: true }` |
 | `GET /session-menu-delete/api/health` | 存活检查，回显各根目录与能力标记 |
 
-> `attachmentsRecoverable: false` 是 `/health` 里刻意回显的能力标记 —— 提醒任何调用方：**删掉的附件捡不回来**。
+`/delete` 的响应里带 `attachmentsRemoved`（本次顺手清掉的独享附件数）、`cascadeRemoved` / `cascadeIds`、**`cascadeFailed`**（级联里没删掉的子代理 —— 它们现在是无主孤儿，静默会让调用方以为级联完整）。
+
+`/attachments/orphans` 与 `/attachments/clean` 的响应里带 `totalObjects` / `referenced` / `orphanCount` / `orphanBytes` / `orphans`（含 hash、大小、年龄）/ `removed`。
+
+`/health` 里三个刻意回显的能力标记：
+
+- `attachmentsRecoverable: false` —— **删掉的附件捡不回来**；
+- `attachmentKinds: ["image-objects"]` —— 只管 `attachments/v1/objects`（图片对象）。**`file-objects/` 与 `files/` 下的文件类附件本插件不清理**，如实回显，别以为"附件都管了"。
+
+### 可调项
+
+bundle patch 的 `config:` 支持两个可选项（默认都是 8000ms）：
+
+```yaml
+- insert:
+    - id: dsh-session-menu-delete
+      name: 'dsh-session-menu-delete'
+      config:
+        idleTimeoutMs: 8000          # 等 agent.whenIdle() 的上限
+        disposeTimeoutMs: 8000       # 等 agent.scope.dispose() 的上限
+```
+
+任一超时都会**中止删除**并回 409 `busy`，响应里的 `error` 会区分「超时」与「被拒绝」。
 
 ## 结构
 
@@ -211,8 +250,8 @@ dsh plugin --profile desktop remove dsh-session-menu-delete
 | `lib/index.js` | host 半：cordis 插件，会话删除 + 血缘扫描 + 附件孤儿清理 + HTTP 端点 |
 | `lib/client.js` | client 半：Module Loader 包（`factory(require)`，无构建步骤），注册菜单项 |
 | `cordis.patch.yml` | bundle 层 patch：往插件树里 insert 一行 |
-| `test-host.mjs` | host 半离线冒烟测试（73 项：级联 / fork 保护 / 附件清理 / 顺手清理 / 新鲜度边界 / 分片收尾 / 端点下线） |
-| `test-client.mjs` | client 半离线冒烟测试（34 项：菜单注册 / 点击链路 / 删当前会话后不跳转 / 各种兜底） |
+| `test-host.mjs` | host 半离线冒烟测试（106 项：级联 / fork 保护 / 附件清理 / 顺手清理 / **内存引用盲区** / 分片收尾 / 访问控制（含 DNS-rebinding）/ 真 HTTP 服务器 / retire 中止（拒绝与超时两条路径）/ 级联失败回报 / 多世代选件 / DSH_HOME 展开） |
+| `test-client.mjs` | client 半离线冒烟测试（35 项：菜单注册 / 点击链路 / 请求头 / 删当前会话后不跳转 / 各种兜底） |
 
 测试用**临时 `DSH_HOME` + mock 服务**跑，工件用真实的多帧 zstd 写（header 帧 + 正文帧），
 级联血缘走的是与线上完全相同的解压路径；全程不碰真实会话数据：
@@ -228,12 +267,24 @@ node test-client.mjs
 - **附件也是直删**：没有回收站、没有 undo。误判的代价不可恢复 —— 所以先跑只读预览（`GET /attachments/orphans`）再动手，永远不会错。
 - 删掉当前正在看的会话后，**界面就留在那个已删会话上**（对话面板显示「会话不可用」），插件不跳转、不开新会话、也不清空主视图 —— 想要新会话点侧栏的「新会话」（详见上文）。
 - 级联只认 `origin === 'subagent'`；fork 出来的会话（有 `parentSession`、无 `origin`）一律不删。
-- 附件清理只动 `attachments/v1/objects` 下的对象，判据是**会话日志里的结构化引用**；"界面上正在显示、但引用尚未落盘"的图由**新鲜度窗口**兜底（窗口内一律不碰）—— 该窗口**只作用于独立清理**，级联删除不看它（见上文）。给出「孤儿」结论时，别只用文本搜哈希：探针自己打印的哈希写进日志会 100% 假命中，必须解析 JSON 里的 `attachmentId`。
+- 附件清理只动 `attachments/v1/objects` 下的对象，判据是**引用集合**（活会话的 `ownEvents()` **并上**磁盘日志的结构化 `attachmentId`）；独享即删、零引用即孤儿。给出「孤儿」结论时，别只用文本搜哈希：探针自己打印的哈希写进日志会 100% 假命中，必须解析 JSON 里的 `attachmentId`。
 - 运行时若 `node:zlib` 没有 zstd 支持，血缘扫描读不到 header，级联会**退化为只删目标会话**；附件清理同样读不到引用，此时会**一个都不删**（保守方向，不会误删）。
 - 对内部服务的访问一律**窄化取值**：拿不到 `workspaceRegistry` 就跳过"账本摘除"这一步，而不是让整个删除失败（比如服务还没注册好、或在其它宿主里被加载）。代价是这种情形下账本不会更新 —— 实时运行时有 `inject` 保证服务存在，正常不会走到这里。
 - 删除回报的 `filesRemoved` / `cacheRemoved` 是**如实**的：`rm(..., {force: true})` 对不存在的路径不报错，所以这两项都不能拿"没抛异常"当"删掉了"（投影缓存那条先 `stat` 确认；工件那条本来就走 `locateSessionDir` 定位）。
-- ⚠️ **已知未修：插件端点不校验来源。** `/session-menu-delete/api/*` 是插件自己的前缀路由，**不经 DSH 的鉴权网关**（实测：DSH 自身路由 `GET /` → 401，插件路由 `GET /…/api/health` → 200），且 handler 不检查 `Content-Type` 与 `Origin`。后果：**本机上的任何程序、以及你浏览器里打开的任意网页**都能调用删除类端点 —— 网页用 `Content-Type: text/plain` 发 POST 属于"简单请求"，不触发 CORS 预检，浏览器拦不住发送（实测该请求返回 200 并进入删除流程）。**当前状态：有意保留未修。** 最小修法是要求一个自定义请求头（如 `x-dsh-plugin-call: 1`）：自定义头必然触发预检，服务端不返回 CORS 头 → 预检失败 → 网页发不出来；本地脚本/命令行补上这个头即可，零成本。
+- ✅ **端点来源校验（已修）。** `/session-menu-delete/api/*` 是插件自己的前缀路由，**不经 DSH 的鉴权网关** —— 那层闸门写在 `client-connection` 自己的 `/api` 路由**内部**（`requestRejection`：跨站/异源 403、未认证 401），而 `dsh-host-webserver` 本身零鉴权，所以插件路由天然绕过它。实测确认：DSH 自身路由 `GET /` → 401，插件路由 `GET /…/api/health` → **200（无任何凭据）**。
+  **现在两层都补上了**：① 所有端点要求 `x-dsh-plugin-call: 1`（自定义头必然触发 CORS 预检，服务端不返回 CORS 头 → 预检失败 → 网页发不出来）；② **Host/Origin 围栏对每个请求都执行**（`connection.requestRejection`）—— 403 一律拦下，401 只对带 `Origin` 的浏览器请求拦下，本机脚本不带 `Origin` 照常可用。
+  ⚠️ ②必须**无条件**执行：自定义头只挡得住**跨源**请求，而 DNS-rebinding 页面与目标**同源** —— 不预检、可自由设置自定义头，同源 GET 又不带 `Origin`。只有无条件跑围栏（Host 必须回环/受信）才拦得住这一路。
+  **仍然保留的风险**：本机同用户的其它进程不受限制 —— 但那在桌面应用里本来就不是安全边界（它们能直接读写 `~/.dsh`）。服务端只绑 `127.0.0.1`（DSH 也硬拒 `--host 0.0.0.0`），不是局域网暴露。
 - client 半优先用 `@deepseek-ai/dsh-client-ui-primitives` 的 `MenuItemButton`；该组件缺失时退回自绘 `role="menuitem"` 按钮，不会让侧栏渲染崩掉。
+- **DSH 侧没有任何会话删除 API。** 全包搜索确认：`removeSession` / `deleteArtifact` 零命中，`workspaceRegistry.delete(id)` 明确写着「保留目录与全部会话日志」，Remote 方法表里也没有 delete/remove。所以本插件是在**填一个真实的空白**，代价是必须用不受支持的拆解方式（裸 `rm` + 摘私有 Map）。已尽量对齐 DSH 自己的 dispose 顺序，但它**不是官方支持的删除路径** —— 升级 DSH 后建议重跑两个测试套件。
+- **路径根是配置项，不是常量。** `sessions` / `storages` / `attachments/v1` 三处都由配置注入（`dsh-base` 的 patch 里是 `dshHomePath(...)`）。本插件按默认组合硬编码这三条路径；`DSH_HOME` 已按 DSH 的 `resolve(expandHomePath(...))` 语义处理（`~/x` 会正确展开成绝对路径），但**若有 overlay / profile 改写了这三个根**，插件就会对不上。
+- **一个会话目录可能有多个格式世代。** DSH 明确保留历史格式世代（迁移只发布新世代，从不删被取代的那份），所以同目录可能同时有 `session.jsonl` 与 `session.v4.jsonl.zstd`。选件规则照抄 DSH 的「取最高版本」，不再是 readdir 顺序（NTFS 上 v0 会排在 v4 前面）。
+- **客户端行消失走 `api-session/removed`，不再自己发 `session/disposed`。** `session/disposed` 声明为 `this: Scoped<Session>`，必须带 scope carrier，而 carrier 是 `dsh-session` 的内部函数产物、插件拿不到；无 carrier 派发会被 `dsh-scope` 的 invariant 直接 `fail`（一个监听者都收不到）。活会话由 `entry.detach()` 发出**正确**的那一个；冷会话则发 `api-session/removed`（该事件**没有** scoped 声明，无需 carrier），它正是客户端 `handleSessionRemoved` 的输入。
+- **补发 `agent/disposed` 时同样带 carrier**（取自 `agents.enter()` 存在 store 条目上的 `scopeTarget(agent, agent)`），并照抄 DSH 的逐监听者 try/catch —— 否则一个监听者抛错会吃掉后面所有。
+- **附件只清 `attachments/v1/objects`（图片对象）。** `file-objects/` 与 `files/` 下的文件类附件**不清理**（`/health` 的 `attachmentKinds` 如实回显）—— 这是漏删，不是误删。
+- **不可逆的账本变更放在文件删除之后**：`rm` 失败时会话账本未动、会话照常可见可重试；retire 超时（`whenIdle` / `scope.dispose`）则**整个删除中止**并回 409 `busy`，绝不留"文件删了一半 / 账本摘了文件还在"的半死状态。
+- **删除失败会恢复归档 / 置顶状态**：`archiveSession` 在同一次写入里会摘掉 pin（DSH 的"归档即摘 pin"语义），若随后 `rm` 失败，插件按删前状态把 pin / 归档恢复回去 —— 删除失败不该顺手改掉用户偏好。
+- **停活走 DSH 自己的 `workspace/session-stop`**（`archiveSession(id, { stopActivity: true })` 触发），覆盖 jobs / schedule / subagent / workspace / desktop-host。已归档的会话不会重复发停活信号，此时 `stopped` 如实报 `false`。
 - `file:` 依赖指向本目录。**移动或删除这个源目录后**，需要重新 `dsh plugin add` 才能再安装/更新；平时改源码则按上文「安装」一节的同步步骤手动刷新副本。
 
 ## License

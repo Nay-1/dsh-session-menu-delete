@@ -70,6 +70,8 @@ const ctx = {
     register: (spec, Component) => { registered.push({ spec, Component }); }
   },
   sessions: { refresh: async () => { refreshed.push("sessions"); } },
+  // 陷阱：真实的 client workspaces 服务**没有** refresh 方法。这里故意提供一个，
+  // 用来钉住"插件不再调用它"（代码若退回去，断言立刻失败）。
   workspaces: { refresh: async () => { refreshed.push("workspaces"); } }
 };
 
@@ -111,8 +113,10 @@ check("点击后发出 POST /session-menu-delete/api/delete",
   fetchCalls.length === 1 && fetchCalls[0].url === "/session-menu-delete/api/delete" && fetchCalls[0].init.method === "POST");
 check("请求体包含 sessionId",
   JSON.parse(fetchCalls[0].init.body).sessionId === "session-x");
-check("成功后刷新了会话列表", refreshed.includes("sessions"));
-check("成功后刷新了工作区列表", refreshed.includes("workspaces"));
+check("请求带上 x-dsh-plugin-call 头（host 半用它挡掉网页发起的请求）",
+  fetchCalls[0].init.headers?.["x-dsh-plugin-call"] === "1");
+check("成功后刷新了会话列表（sessions.refresh 真实存在）", refreshed.includes("sessions"));
+check("不再调用不存在的 workspaces.refresh（死代码已移除）", !refreshed.includes("workspaces"));
 check("没有弹出错误", alerts.length === 0);
 
 // ---- 失败路径 -------------------------------------------------------------
@@ -120,6 +124,8 @@ globalThis.fetch = async () => ({ status: 500, json: async () => ({ ok: false, e
 face.requestDelete("session-y", "另一个会话");
 await new Promise((resolve) => setTimeout(resolve, 20));
 check("失败时弹出错误提示", alerts.length === 1 && alerts[0].includes("会话正在运行"));
+/** 基线：后面成功路径的断言用「不新增」而不是硬编码 1（那个 1 是上面失败用例留下的）。 */
+const alertsAfterFailure = alerts.length;
 
 // ---- 删掉「正在看的会话」→ 界面留在那儿（有意如此）-------------------------
 // 回归：早先版本会在这种情况下自动开新会话（uiWorkspace.startSession），开不起来再
@@ -170,7 +176,7 @@ check("删别的会话时也不跳转", fetchCalls.length === beforeOther + 1 &&
 // 延长观察窗口：旧版那个 4 秒兜底定时器若还在，这里会露出来
 await new Promise((resolve) => realSetTimeout(resolve, 60));
 check("没有任何延迟兜底动作（旧版 4 秒定时器已移除）", navCalls.length === 0);
-check("删除成功路径不弹错误", alerts.length === 1);
+check("成功路径没有再弹错误（相对失败用例不新增 alert）", alerts.length === alertsAfterFailure);
 
 // ---- 汇总 -----------------------------------------------------------------
 console.log("\n" + CONTRACT.join("\n"));
