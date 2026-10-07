@@ -5,8 +5,8 @@
  * 工件用真实的多帧 zstd 写（第一帧是 header 行），这样级联血缘扫描走的是
  * 与线上完全相同的解压路径。
  */
-import { mkdtemp, mkdir, utimes, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { appendFile, mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Readable } from "node:stream";
@@ -655,6 +655,98 @@ await writeArtifact("session-share-q", { id: "session-share-q", delegationDepth:
     res.payload.result.attachmentsRemoved === 1
     && !existsSync(join(objectsRoot, goneHash.slice(0, 2), goneHash))
     && existsSync(join(objectsRoot, keepHash.slice(0, 2))));
+}
+
+// ---- 附件引用索引缓存：(size, mtime, ctime, ino) 失效必须正确 ----------------
+// 缓存是「少报 -> 删掉还在用的附件」这条危险路径上唯一的新增风险，逐条钉死。
+// 这里用**纯 .jsonl 工件**（不是 zstd）是为了精确控制字节长度 —— 等长重写是最危险的场景：
+// size 完全相同、只有内容不同，只能靠 mtime/ctime/ino 识别。
+{
+  const jsonlArtifact = async (id, lines) => {
+    const dir = join(sessionsDir, id);
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, "session.jsonl");
+    await writeFile(file, lines.map((line) => `${JSON.stringify(line)}\n`).join(""), "utf8");
+    return file;
+  };
+  const headerLine = (id) => ({ type: "session", version: 1, id, createdAt: 0, cwd: "C:\\Users\\demo\\fake-project" });
+  const refLine = (hash, name) => ({
+    type: "user/message", seq: 2, time: 0,
+    data: { content: [{ type: "image", attachment: { attachmentId: `sha256:${hash}`, bytes: 24, name } }] }
+  });
+  const orphans = async () => {
+    const res = await request("GET", "/session-menu-delete/api/attachments/orphans");
+    return new Set(res.payload.result.orphans.map((o) => o.hash));
+  };
+
+  // 1) 追加一帧：新引用必须立刻可见（缓存必须 miss）
+  const hashAppended = "91" + "a".repeat(62);
+  await putObject(hashAppended);
+  const appendedFile = await jsonlArtifact("session-cache-append", [headerLine("session-cache-append")]);
+  check("缓存·前置：追加前该对象是孤儿", (await orphans()).has(hashAppended));
+  await appendFile(appendedFile, `${JSON.stringify(refLine(hashAppended, "appended.png"))}\n`, "utf8");
+  check("缓存·追加一帧后新引用立刻可见（size 变了必须重扫）", !(await orphans()).has(hashAppended));
+
+  // 2) 重写变短、去掉引用：必须立刻变回孤儿
+  const hashRewritten = "92" + "b".repeat(62);
+  await putObject(hashRewritten);
+  await jsonlArtifact("session-cache-rewrite",
+    [headerLine("session-cache-rewrite"), refLine(hashRewritten, "rewritten.png")]);
+  check("缓存·前置：重写前该对象不是孤儿", !(await orphans()).has(hashRewritten));
+  await jsonlArtifact("session-cache-rewrite", [headerLine("session-cache-rewrite")]);
+  check("缓存·重写变短去掉引用后立刻变孤儿（size 变了必须重扫）", (await orphans()).has(hashRewritten));
+
+  // 3) 等长重写 —— 最危险场景：size 一模一样，只有内容不同
+  const hashEqX = "93" + "c".repeat(62);
+  const hashEqY = "94" + "d".repeat(62);
+  await putObject(hashEqX);
+  await putObject(hashEqY);
+  const eqFile = await jsonlArtifact("session-cache-eqlen",
+    [headerLine("session-cache-eqlen"), refLine(hashEqX, "eqlen.png")]);
+  check("缓存·前置：等长重写前 X 不是孤儿", !(await orphans()).has(hashEqX));
+  const sizeBefore = statSync(eqFile).size;
+  await jsonlArtifact("session-cache-eqlen",
+    [headerLine("session-cache-eqlen"), refLine(hashEqY, "eqlen.png")]);
+  check("缓存·等长重写确实是等长的（这条用例本身必须有效）", statSync(eqFile).size === sizeBefore);
+  const eqOrphans = await orphans();
+  check("缓存·等长重写后旧引用必须失效（X 变孤儿）", eqOrphans.has(hashEqX));
+  check("缓存·等长重写后新引用必须可见（Y 不是孤儿）", !eqOrphans.has(hashEqY));
+
+  // 4) 工件被删掉后不得回吐旧引用
+  const hashGone = "95" + "e".repeat(62);
+  await putObject(hashGone);
+  const goneFile = await jsonlArtifact("session-cache-gone",
+    [headerLine("session-cache-gone"), refLine(hashGone, "gone.png")]);
+  check("缓存·前置：工件在时该对象不是孤儿", !(await orphans()).has(hashGone));
+  await rm(goneFile, { force: true });
+  check("缓存·工件被删后不得回吐旧引用（该对象变孤儿）", (await orphans()).has(hashGone));
+
+  // 5) 等价性：连续两次扫描结果必须完全一致
+  const firstScan = await orphans();
+  const secondScan = await orphans();
+  check("缓存·连续两次扫描结果全等（命中缓存不改变结论）",
+    firstScan.size === secondScan.size && [...firstScan].every((hash) => secondScan.has(hash)));
+
+  // 6) 第一阶段短路：删「没引用过附件」的会话，别人的附件一个都不许动
+  const hashBystander = "96" + "f".repeat(62);
+  await putObject(hashBystander);
+  await jsonlArtifact("session-cache-bystander",
+    [headerLine("session-cache-bystander"), refLine(hashBystander, "bystander.png")]);
+  await jsonlArtifact("session-cache-noref", [headerLine("session-cache-noref")]);
+  const noRefRes = await request("POST", "/session-menu-delete/api/delete", { sessionId: "session-cache-noref" });
+  check("短路·删无引用的会话：一个附件都不删，旁观者的对象原封不动",
+    noRefRes.payload.result.attachmentsRemoved === 0
+    && existsSync(join(objectsRoot, hashBystander.slice(0, 2), hashBystander)));
+
+  // 7) 第一阶段短路：删「有引用」的会话，它独享的附件照删（证明 only 过滤没漏掉 doomed 自己）
+  const hashSolo = "97" + "0".repeat(62);
+  await putObject(hashSolo);
+  await jsonlArtifact("session-cache-solo",
+    [headerLine("session-cache-solo"), refLine(hashSolo, "solo.png")]);
+  const soloRes = await request("POST", "/session-menu-delete/api/delete", { sessionId: "session-cache-solo" });
+  check("短路·删有引用的会话：独享附件照删（only 过滤没漏掉 doomed 自己）",
+    soloRes.payload.result.attachmentsRemoved === 1
+    && !existsSync(join(objectsRoot, hashSolo.slice(0, 2), hashSolo)));
 }
 
 // ---- 活会话内存里未落盘的引用必须算数 -------------------------------------
